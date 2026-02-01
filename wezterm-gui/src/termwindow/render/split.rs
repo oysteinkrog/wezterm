@@ -1,5 +1,6 @@
 use crate::termwindow::render::TripleLayerQuadAllocator;
 use crate::termwindow::{UIItem, UIItemType};
+use config::TabBarPosition;
 use mux::pane::Pane;
 use mux::tab::{PositionedSplit, SplitDirection};
 use std::sync::Arc;
@@ -17,16 +18,26 @@ impl crate::TermWindow {
         let cell_height = self.render_metrics.cell_size.height as f32;
 
         let border = self.get_os_border();
-        let first_row_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+        let is_vertical_tab_bar = self.show_tab_bar && self.config.is_vertical_tab_bar();
+        let first_row_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom && !is_vertical_tab_bar {
             self.tab_bar_pixel_height()?
         } else {
             0.
         } + border.top.get() as f32;
 
+        // Horizontal offset for left-positioned vertical tab bar
+        let first_col_offset = if is_vertical_tab_bar
+            && self.config.effective_tab_bar_position() == TabBarPosition::Left
+        {
+            self.tab_bar_pixel_width()
+        } else {
+            0.
+        };
+
         let (padding_left, padding_top) = self.padding_left_top();
 
         let pos_y = split.top as f32 * cell_height + first_row_offset + padding_top;
-        let pos_x = split.left as f32 * cell_width + padding_left + border.left.get() as f32;
+        let pos_x = first_col_offset + split.left as f32 * cell_width + padding_left + border.left.get() as f32;
 
         if split.direction == SplitDirection::Horizontal {
             self.filled_rectangle(
@@ -41,7 +52,8 @@ impl crate::TermWindow {
                 foreground,
             )?;
             self.ui_items.push(UIItem {
-                x: border.left.get() as usize
+                x: first_col_offset as usize
+                    + border.left.get() as usize
                     + padding_left as usize
                     + (split.left * cell_width as usize),
                 width: cell_width as usize,
@@ -64,7 +76,8 @@ impl crate::TermWindow {
                 foreground,
             )?;
             self.ui_items.push(UIItem {
-                x: border.left.get() as usize
+                x: first_col_offset as usize
+                    + border.left.get() as usize
                     + padding_left as usize
                     + (split.left * cell_width as usize),
                 width: split.size * cell_width as usize,

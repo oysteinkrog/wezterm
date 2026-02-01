@@ -216,6 +216,8 @@ pub struct TabInformation {
     pub active_pane: Option<PaneInformation>,
     pub window_id: MuxWindowId,
     pub tab_title: String,
+    /// True if a bell has rung in this tab while it wasn't active
+    pub has_bell: bool,
 }
 
 impl UserData for TabInformation {
@@ -245,6 +247,7 @@ impl UserData for TabInformation {
         });
         fields.add_field_method_get("window_id", |_, this| Ok(this.window_id));
         fields.add_field_method_get("tab_title", |_, this| Ok(this.tab_title.clone()));
+        fields.add_field_method_get("has_bell", |_, this| Ok(this.has_bell));
         fields.add_field_method_get("window_title", |_, this| {
             let mux = Mux::get();
             let window = mux.get_window(this.window_id).ok_or_else(|| {
@@ -345,6 +348,9 @@ pub struct TabState {
     /// contents, we're overlaying a little internal application
     /// tab.  We'll also route input to it.
     pub overlay: Option<OverlayState>,
+    /// Set to true when a bell sounds in this tab while it's not active.
+    /// Cleared when the tab becomes active.
+    pub bell_rung: bool,
 }
 
 /// Manages the state/queue of lua based event handlers.
@@ -1244,6 +1250,19 @@ impl TermWindow {
 
                     let mut per_pane = self.pane_state(pane_id);
                     per_pane.bell_start.replace(Instant::now());
+
+                    // Set bell_rung on the tab if it's not the active tab
+                    let mux = Mux::get();
+                    if let Some(mux_window) = mux.get_window(self.mux_window_id) {
+                        let active_tab_idx = mux_window.get_active_idx();
+                        for (idx, tab) in mux_window.iter().enumerate() {
+                            if tab.contains_pane(pane_id) && idx != active_tab_idx {
+                                self.tab_state(tab.tab_id()).bell_rung = true;
+                                break;
+                            }
+                        }
+                    }
+
                     window.invalidate();
                 }
                 MuxNotification::Alert {
@@ -1970,38 +1989,81 @@ impl TermWindow {
         let active_pane = panes.iter().find(|p| p.is_active).cloned();
 
         let border = self.get_os_border();
+        let is_vertical_tab_bar = self.config.is_vertical_tab_bar();
         let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
-        let tab_bar_y = if self.config.tab_bar_at_bottom {
+        let tab_bar_width = self.tab_bar_pixel_width();
+        let tab_bar_position = self.config.effective_tab_bar_position();
+
+        let tab_bar_y = if self.config.tab_bar_at_bottom && !is_vertical_tab_bar {
             ((self.dimensions.pixel_height as f32) - (tab_bar_height + border.bottom.get() as f32))
                 .max(0.)
         } else {
             border.top.get() as f32
         };
 
-        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+        let tab_bar_x = match tab_bar_position {
+            config::TabBarPosition::Left => border.left.get() as f32,
+            config::TabBarPosition::Right => {
+                (self.dimensions.pixel_width as f32) - tab_bar_width - border.right.get() as f32
+            }
+            _ => 0.,
+        };
 
         let hovering_in_tab_bar = match &self.current_mouse_event {
             Some(event) => {
-                let mouse_y = event.coords.y as f32;
-                mouse_y >= tab_bar_y as f32 && mouse_y < tab_bar_y as f32 + tab_bar_height
+                if is_vertical_tab_bar {
+                    let mouse_x = event.coords.x as f32;
+                    let mouse_y = event.coords.y as f32;
+                    mouse_x >= tab_bar_x
+                        && mouse_x < tab_bar_x + tab_bar_width
+                        && mouse_y >= border.top.get() as f32
+                        && mouse_y
+                            < (self.dimensions.pixel_height as f32 - border.bottom.get() as f32)
+                } else {
+                    let mouse_y = event.coords.y as f32;
+                    mouse_y >= tab_bar_y && mouse_y < tab_bar_y + tab_bar_height
+                }
             }
             None => false,
         };
 
-        let new_tab_bar = TabBarState::new(
-            self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
-            if hovering_in_tab_bar {
-                Some(self.last_mouse_coords.0)
+        let new_tab_bar = if is_vertical_tab_bar {
+            let tab_height_rows =
+                self.dimensions.pixel_height / self.render_metrics.cell_size.height as usize;
+            let tab_width_cols = self.config.vertical_tab_width;
+            let mouse_row = if hovering_in_tab_bar {
+                let mouse_y = self.last_mouse_coords.1 as f32 - border.top.get() as f32;
+                Some((mouse_y / self.render_metrics.cell_size.height as f32) as usize)
             } else {
                 None
-            },
-            &tabs,
-            &panes,
-            self.config.resolved_palette.tab_bar.as_ref(),
-            &self.config,
-            &self.left_status,
-            &self.right_status,
-        );
+            };
+            TabBarState::new_vertical(
+                tab_height_rows,
+                tab_width_cols,
+                mouse_row,
+                &tabs,
+                &panes,
+                self.config.resolved_palette.tab_bar.as_ref(),
+                &self.config,
+                &self.left_status,
+                &self.right_status,
+            )
+        } else {
+            TabBarState::new(
+                self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
+                if hovering_in_tab_bar {
+                    Some(self.last_mouse_coords.0)
+                } else {
+                    None
+                },
+                &tabs,
+                &panes,
+                self.config.resolved_palette.tab_bar.as_ref(),
+                &self.config,
+                &self.left_status,
+                &self.right_status,
+            )
+        };
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();
@@ -2193,9 +2255,16 @@ impl TermWindow {
         };
 
         if tab_idx < max {
+            // Get the tab_id before dropping the window reference
+            let tab_id = window.get_by_idx(tab_idx).map(|tab| tab.tab_id());
             window.save_and_then_set_active(tab_idx);
 
             drop(window);
+
+            // Clear bell_rung flag when tab becomes active
+            if let Some(tab_id) = tab_id {
+                self.tab_state(tab_id).bell_rung = false;
+            }
 
             if let Some(tab) = self.get_active_pane_or_overlay() {
                 tab.focus_changed(true);
@@ -3468,9 +3537,11 @@ impl TermWindow {
             .map(|(idx, tab)| {
                 let panes = self.get_pos_panes_for_tab(tab);
 
+                let tab_id = tab.tab_id();
+                let has_bell = self.tab_state(tab_id).bell_rung;
                 TabInformation {
                     tab_index: idx,
-                    tab_id: tab.tab_id(),
+                    tab_id,
                     is_active: tab_index == idx,
                     is_last_active: window
                         .get_last_active_idx()
@@ -3482,6 +3553,7 @@ impl TermWindow {
                         .iter()
                         .find(|p| p.is_active)
                         .map(Self::pos_pane_to_pane_info),
+                    has_bell,
                 }
             })
             .collect()

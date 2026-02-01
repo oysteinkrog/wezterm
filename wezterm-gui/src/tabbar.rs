@@ -16,6 +16,8 @@ use window::{IntegratedTitleButton, IntegratedTitleButtonAlignment, IntegratedTi
 pub struct TabBarState {
     line: Line,
     items: Vec<TabEntry>,
+    vertical_lines: Vec<Line>,
+    is_vertical: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +36,8 @@ pub struct TabEntry {
     pub title: Line,
     x: usize,
     width: usize,
+    y: usize,
+    height: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -227,7 +231,11 @@ impl TabBarState {
                 title: Line::from_text(" ", &CellAttributes::blank(), 1, None),
                 x: 1,
                 width: 1,
+                y: 0,
+                height: 1,
             }],
+            vertical_lines: vec![],
+            is_vertical: false,
         }
     }
 
@@ -237,6 +245,14 @@ impl TabBarState {
 
     pub fn items(&self) -> &[TabEntry] {
         &self.items
+    }
+
+    pub fn vertical_lines(&self) -> &[Line] {
+        &self.vertical_lines
+    }
+
+    pub fn is_vertical(&self) -> bool {
+        self.is_vertical
     }
 
     fn integrated_title_buttons(
@@ -320,6 +336,8 @@ impl TabBarState {
                 title: title.to_owned(),
                 x: *x,
                 width,
+                y: 0,
+                height: 1,
             });
 
             *x += width;
@@ -345,6 +363,8 @@ impl TabBarState {
         let active_cell_attrs = colors.active_tab().as_cell_attributes();
         let inactive_hover_attrs = colors.inactive_tab_hover().as_cell_attributes();
         let inactive_cell_attrs = colors.inactive_tab().as_cell_attributes();
+        let inactive_bell_attrs = colors.inactive_tab_bell().as_cell_attributes();
+        let inactive_bell_hover_attrs = colors.inactive_tab_bell_hover().as_cell_attributes();
         let new_tab_hover_attrs = colors.new_tab_hover().as_cell_attributes();
         let new_tab_attrs = colors.new_tab().as_cell_attributes();
 
@@ -447,10 +467,25 @@ impl TabBarState {
                 title: left_status_line.clone(),
                 x,
                 width: left_status_line.len(),
+                y: 0,
+                height: 1,
             });
             x += left_status_line.len();
             line.append_line(left_status_line, SEQ_ZERO);
         }
+
+        let stretched_widths: Vec<usize> = if config.stretch_retro_tabs_to_fill
+            && !config.use_fancy_tab_bar
+            && number_of_tabs > 0
+        {
+            let base = available_cells / number_of_tabs;
+            let remainder = available_cells % number_of_tabs;
+            (0..number_of_tabs)
+                .map(|i| base + if i < remainder { 1 } else { 0 })
+                .collect()
+        } else {
+            vec![]
+        };
 
         for (tab_idx, tab_title) in tab_titles.iter().enumerate() {
             let tab_title_len = tab_title.len.min(tab_width_max);
@@ -468,8 +503,13 @@ impl TabBarState {
                 tab_title_len,
             );
 
+            let has_bell = tab_info[tab_idx].has_bell;
             let cell_attrs = if active {
                 &active_cell_attrs
+            } else if has_bell && hover {
+                &inactive_bell_hover_attrs
+            } else if has_bell {
+                &inactive_bell_attrs
             } else if hover {
                 &inactive_hover_attrs
             } else {
@@ -493,6 +533,13 @@ impl TabBarState {
                 tab_line.resize(tab_width_max, SEQ_ZERO);
             }
 
+            if let Some(&target_width) = stretched_widths.get(tab_idx) {
+                let pad_cell = Cell::blank_with_attrs(cell_attrs.clone());
+                while tab_line.len() < target_width {
+                    tab_line.insert_cell(tab_line.len(), pad_cell.clone(), target_width, SEQ_ZERO);
+                }
+            }
+
             let width = tab_line.len();
 
             items.push(TabEntry {
@@ -500,6 +547,8 @@ impl TabBarState {
                 title,
                 x: tab_start_idx,
                 width,
+                y: 0,
+                height: 1,
             });
 
             line.append_line(tab_line, SEQ_ZERO);
@@ -522,6 +571,8 @@ impl TabBarState {
                 title: new_tab_button.clone(),
                 x: button_start,
                 width,
+                y: 0,
+                height: 1,
             });
 
             x += width;
@@ -584,6 +635,8 @@ impl TabBarState {
             title: right_status_line.clone(),
             x,
             width: status_space_available,
+            y: 0,
+            height: 1,
         });
 
         while right_status_line.len() > status_space_available {
@@ -603,20 +656,258 @@ impl TabBarState {
             Self::integrated_title_buttons(mouse_x, &mut x, config, &mut items, &mut line, &colors);
         }
 
-        Self { line, items }
+        Self {
+            line,
+            items,
+            vertical_lines: vec![],
+            is_vertical: false,
+        }
     }
 
-    pub fn compute_ui_items(&self, y: usize, cell_height: usize, cell_width: usize) -> Vec<UIItem> {
+    /// Build a vertical tab bar from the current state.
+    /// mouse_y is the row index if the mouse is in the tab bar region.
+    /// tab_height is the total number of cell rows available for the tab bar.
+    pub fn new_vertical(
+        tab_height: usize,
+        tab_width: usize,
+        mouse_y: Option<usize>,
+        tab_info: &[TabInformation],
+        pane_info: &[PaneInformation],
+        colors: Option<&TabBarColors>,
+        config: &ConfigHandle,
+        _left_status: &str,
+        _right_status: &str,
+    ) -> Self {
+        let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
+
+        let active_cell_attrs = colors.active_tab().as_cell_attributes();
+        let inactive_hover_attrs = colors.inactive_tab_hover().as_cell_attributes();
+        let inactive_cell_attrs = colors.inactive_tab().as_cell_attributes();
+        let inactive_bell_attrs = colors.inactive_tab_bell().as_cell_attributes();
+        let inactive_bell_hover_attrs = colors.inactive_tab_bell_hover().as_cell_attributes();
+        let new_tab_hover_attrs = colors.new_tab_hover().as_cell_attributes();
+        let new_tab_attrs = colors.new_tab().as_cell_attributes();
+
+        let cell_height = config.vertical_tab_cell_height;
+
+        let mut active_tab_no = 0;
+
+        let tab_titles: Vec<TitleText> = if config.show_tabs_in_tab_bar {
+            tab_info
+                .iter()
+                .map(|tab| {
+                    if tab.is_active {
+                        active_tab_no = tab.tab_index;
+                    }
+                    compute_tab_title(
+                        tab,
+                        tab_info,
+                        pane_info,
+                        config,
+                        false,
+                        tab_width.saturating_sub(2), // Leave some padding
+                    )
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        let mut vertical_lines: Vec<Line> = vec![];
+        let mut items = vec![];
+        let mut y = 0;
+
+        let black_cell = Cell::blank_with_attrs(
+            CellAttributes::default()
+                .set_background(termwiz::color::ColorSpec::TrueColor(*colors.background()))
+                .clone(),
+        );
+
+        // Helper to check if mouse is over a tab row
+        let is_tab_hover_vertical = |mouse_y: Option<usize>, y: usize, height: usize| -> bool {
+            mouse_y
+                .map(|my| my >= y && my < y + height)
+                .unwrap_or(false)
+        };
+
+        // Render each tab as one or more rows
+        for (tab_idx, _tab_title) in tab_titles.iter().enumerate() {
+            let active = tab_idx == active_tab_no;
+            let hover = !active && is_tab_hover_vertical(mouse_y, y, cell_height);
+
+            // Recompute title with hover state
+            let tab_title = compute_tab_title(
+                &tab_info[tab_idx],
+                tab_info,
+                pane_info,
+                config,
+                hover,
+                tab_width.saturating_sub(2),
+            );
+
+            let has_bell = tab_info[tab_idx].has_bell;
+            let cell_attrs = if active {
+                &active_cell_attrs
+            } else if has_bell && hover {
+                &inactive_bell_hover_attrs
+            } else if has_bell {
+                &inactive_bell_attrs
+            } else if hover {
+                &inactive_hover_attrs
+            } else {
+                &inactive_cell_attrs
+            };
+
+            let esc = format_as_escapes(tab_title.items.clone()).expect("already parsed ok above");
+            let mut tab_line = parse_status_text(
+                &esc,
+                if config.use_fancy_tab_bar {
+                    CellAttributes::default()
+                } else {
+                    cell_attrs.clone()
+                },
+            );
+
+            let title = tab_line.clone();
+
+            // Truncate or pad to fit the width
+            if tab_line.len() > tab_width {
+                tab_line.resize(tab_width, SEQ_ZERO);
+            } else {
+                let pad_cell = Cell::blank_with_attrs(cell_attrs.clone());
+                while tab_line.len() < tab_width {
+                    tab_line.insert_cell(tab_line.len(), pad_cell.clone(), tab_width, SEQ_ZERO);
+                }
+            }
+
+            let tab_start_y = y;
+
+            // Add the tab line(s)
+            for _ in 0..cell_height {
+                vertical_lines.push(tab_line.clone());
+                y += 1;
+            }
+
+            items.push(TabEntry {
+                item: TabBarItem::Tab { tab_idx, active },
+                title,
+                x: 0,
+                width: tab_width,
+                y: tab_start_y,
+                height: cell_height,
+            });
+        }
+
+        // New tab button
+        if config.show_new_tab_button_in_tab_bar && y < tab_height {
+            let hover = is_tab_hover_vertical(mouse_y, y, cell_height);
+
+            let new_tab_attrs_to_use = if hover {
+                &new_tab_hover_attrs
+            } else {
+                &new_tab_attrs
+            };
+
+            let new_tab_text = parse_status_text(
+                &config.tab_bar_style.new_tab,
+                if config.use_fancy_tab_bar {
+                    CellAttributes::default()
+                } else {
+                    new_tab_attrs_to_use.clone()
+                },
+            );
+
+            let mut new_tab_line = if hover {
+                parse_status_text(
+                    &config.tab_bar_style.new_tab_hover,
+                    if config.use_fancy_tab_bar {
+                        CellAttributes::default()
+                    } else {
+                        new_tab_hover_attrs.clone()
+                    },
+                )
+            } else {
+                new_tab_text.clone()
+            };
+
+            // Pad to width
+            let pad_cell = Cell::blank_with_attrs(new_tab_attrs_to_use.clone());
+            while new_tab_line.len() < tab_width {
+                new_tab_line.insert_cell(
+                    new_tab_line.len(),
+                    pad_cell.clone(),
+                    tab_width,
+                    SEQ_ZERO,
+                );
+            }
+            if new_tab_line.len() > tab_width {
+                new_tab_line.resize(tab_width, SEQ_ZERO);
+            }
+
+            let button_start_y = y;
+            for _ in 0..cell_height {
+                vertical_lines.push(new_tab_line.clone());
+                y += 1;
+            }
+
+            items.push(TabEntry {
+                item: TabBarItem::NewTabButton,
+                title: new_tab_text,
+                x: 0,
+                width: tab_width,
+                y: button_start_y,
+                height: cell_height,
+            });
+        }
+
+        // Fill remaining rows with background
+        while y < tab_height {
+            let mut empty_line = Line::with_width(tab_width, SEQ_ZERO);
+            for col in 0..tab_width {
+                empty_line.set_cell(col, black_cell.clone(), SEQ_ZERO);
+            }
+            vertical_lines.push(empty_line);
+            y += 1;
+        }
+
+        // For vertical, the 'line' field is not used but we still need it
+        Self {
+            line: Line::with_width(1, SEQ_ZERO),
+            items,
+            vertical_lines,
+            is_vertical: true,
+        }
+    }
+
+    pub fn compute_ui_items(
+        &self,
+        base_y: usize,
+        base_x: usize,
+        cell_height: usize,
+        cell_width: usize,
+    ) -> Vec<UIItem> {
         let mut items = vec![];
 
-        for entry in self.items.iter() {
-            items.push(UIItem {
-                x: entry.x * cell_width,
-                width: entry.width * cell_width,
-                y,
-                height: cell_height,
-                item_type: UIItemType::TabBar(entry.item),
-            });
+        if self.is_vertical {
+            for entry in self.items.iter() {
+                items.push(UIItem {
+                    x: base_x,
+                    width: entry.width * cell_width,
+                    y: base_y + entry.y * cell_height,
+                    height: entry.height * cell_height,
+                    item_type: UIItemType::TabBar(entry.item),
+                });
+            }
+        } else {
+            for entry in self.items.iter() {
+                items.push(UIItem {
+                    x: base_x + entry.x * cell_width,
+                    width: entry.width * cell_width,
+                    y: base_y,
+                    height: cell_height,
+                    item_type: UIItemType::TabBar(entry.item),
+                });
+            }
         }
 
         items

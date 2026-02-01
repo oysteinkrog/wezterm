@@ -476,6 +476,15 @@ pub struct Config {
     #[dynamic(default)]
     pub tab_bar_at_bottom: bool,
 
+    #[dynamic(default)]
+    pub tab_bar_position: TabBarPosition,
+
+    #[dynamic(default = "default_vertical_tab_width")]
+    pub vertical_tab_width: usize,
+
+    #[dynamic(default = "default_vertical_tab_cell_height")]
+    pub vertical_tab_cell_height: usize,
+
     #[dynamic(default = "default_true")]
     pub mouse_wheel_scrolls_tabs: bool,
 
@@ -501,6 +510,11 @@ pub struct Config {
     /// tab bar.  Defaults to 16 glyphs in width.
     #[dynamic(default = "default_tab_max_width")]
     pub tab_max_width: usize,
+
+    /// If true, stretch retro-style tabs to fill the full tab bar width.
+    /// Only applies when use_fancy_tab_bar is false.
+    #[dynamic(default)]
+    pub stretch_retro_tabs_to_fill: bool,
 
     /// If true, hide the tab bar if the window only has a single tab.
     #[dynamic(default)]
@@ -1310,6 +1324,26 @@ impl Config {
         map
     }
 
+    /// Returns the effective tab bar position, taking into account both
+    /// `tab_bar_position` and the legacy `tab_bar_at_bottom` options.
+    pub fn effective_tab_bar_position(&self) -> TabBarPosition {
+        if self.tab_bar_position != TabBarPosition::Top {
+            self.tab_bar_position
+        } else if self.tab_bar_at_bottom {
+            TabBarPosition::Bottom
+        } else {
+            TabBarPosition::Top
+        }
+    }
+
+    /// Returns true if the tab bar is positioned vertically (left or right).
+    pub fn is_vertical_tab_bar(&self) -> bool {
+        matches!(
+            self.effective_tab_bar_position(),
+            TabBarPosition::Left | TabBarPosition::Right
+        )
+    }
+
     /// In some cases we need to compute expanded values based
     /// on those provided by the user.  This is where we do that.
     pub fn compute_extra_defaults(&self, config_path: Option<&Path>) -> Self {
@@ -1868,6 +1902,14 @@ fn default_tab_max_width() -> usize {
     16
 }
 
+fn default_vertical_tab_width() -> usize {
+    20
+}
+
+fn default_vertical_tab_cell_height() -> usize {
+    1
+}
+
 fn default_update_interval() -> u64 {
     86400
 }
@@ -1897,6 +1939,15 @@ pub enum DefaultCursorStyle {
     SteadyUnderline,
     BlinkingBar,
     SteadyBar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic, Default)]
+pub enum TabBarPosition {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
 }
 
 impl DefaultCursorStyle {
