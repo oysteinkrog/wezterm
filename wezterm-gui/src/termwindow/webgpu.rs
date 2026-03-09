@@ -560,7 +560,7 @@ impl WebGpuState {
             })
             .await;
 
-        let adapter = adapter.ok_or_else(|| anyhow!("no software fallback adapter available"))?;
+        let adapter = adapter.map_err(|e| anyhow!("no software fallback adapter available: {e}"))?;
 
         let adapter_info = adapter.get_info();
         log::info!("Software fallback adapter: {adapter_info:?}");
@@ -570,7 +570,7 @@ impl WebGpuState {
         let caps = surface.get_capabilities(&adapter);
         let downlevel_caps = adapter.get_downlevel_capabilities();
 
-        let (device, queue) = adapter
+        let (device, queue): (wgpu::Device, wgpu::Queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 required_features: wgpu::Features::empty(),
                 required_limits: if cfg!(target_arch = "wasm32") {

@@ -1,3 +1,10 @@
+# On Ubuntu 24.04 (and other multiarch distros), pkg-config and OpenSSL headers
+# are in multiarch-specific paths that are not searched by default.
+[env]
+PKG_CONFIG_PATH = "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+OPENSSL_LIB_DIR = "/usr/lib/x86_64-linux-gnu"
+CFLAGS = "-I/usr/include/x86_64-linux-gnu"
+
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-gcc-ar"
