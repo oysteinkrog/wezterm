@@ -67,6 +67,7 @@ use wezterm_font::FontConfiguration;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
+use wezterm_toast_notification::persistent_toast_notification;
 
 pub mod background;
 pub mod box_model;
@@ -87,6 +88,18 @@ use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
 const ATLAS_SIZE: usize = 128;
+
+/// Maximum number of GPU recovery attempts before falling back
+const MAX_GPU_RECOVERY_ATTEMPTS: u32 = 5;
+
+/// Tracks the current rendering backend for fallback and status reporting
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderBackend {
+    WebGpu,
+    OpenGL,
+    /// Software rendering via wgpu with force_fallback_adapter (WARP on Windows)
+    Software,
+}
 
 lazy_static::lazy_static! {
     static ref WINDOW_CLASS: Mutex<String> = Mutex::new(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS.to_owned());
@@ -469,6 +482,7 @@ pub struct TermWindow {
     gl: Option<Rc<glium::backend::Context>>,
     webgpu: Option<Rc<WebGpuState>>,
     config_subscription: Option<config::ConfigSubscription>,
+    render_backend: RenderBackend,
 }
 
 impl TermWindow {
@@ -794,6 +808,11 @@ impl TermWindow {
             key_table_state: KeyTableState::default(),
             modal: RefCell::new(None),
             opengl_info: None,
+            render_backend: match config.front_end {
+                FrontEndSelection::WebGpu => RenderBackend::WebGpu,
+                FrontEndSelection::Software => RenderBackend::Software,
+                _ => RenderBackend::OpenGL,
+            },
         };
 
         let tw = Rc::new(RefCell::new(myself));
@@ -1085,21 +1104,51 @@ impl TermWindow {
                 self.dimensions.pixel_height as u32,
             ),
         );
-        self.paint_impl(&mut RenderFrame::Glium(&mut frame));
+        if let Err(err) = self.paint_impl(&mut RenderFrame::Glium(&mut frame)) {
+            log::error!("OpenGL paint failed: {:#}", err);
+        }
         window.finish_frame(frame).is_ok()
     }
 
     fn do_paint_webgpu(&mut self) -> anyhow::Result<bool> {
-        self.webgpu.as_mut().unwrap().resize(self.dimensions);
+        // Check if GPU device was lost (TDR, driver crash, etc.)
+        if self
+            .webgpu
+            .as_ref()
+            .map_or(false, |w| w.device_lost.load(Ordering::SeqCst))
+        {
+            log::warn!("GPU device lost detected, attempting recovery...");
+            return self.attempt_gpu_recovery();
+        }
+
+        let webgpu = self
+            .webgpu
+            .as_ref()
+            .ok_or_else(|| anyhow!("WebGPU state not available"))?;
+        webgpu.resize(self.dimensions);
         match self.do_paint_webgpu_impl() {
             Ok(ok) => Ok(ok),
             Err(err) => {
                 match err.downcast_ref::<wgpu::SurfaceError>() {
                     Some(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        self.webgpu.as_mut().unwrap().resize(self.dimensions);
+                        if let Some(webgpu) = self.webgpu.as_ref() {
+                            webgpu.resize(self.dimensions);
+                        }
                         return self.do_paint_webgpu_impl();
                     }
-                    _ => {}
+                    Some(wgpu::SurfaceError::Timeout) => {
+                        log::warn!("GPU surface timeout, will retry next frame");
+                        return Ok(false);
+                    }
+                    Some(wgpu::SurfaceError::OutOfMemory) => {
+                        log::error!("GPU out of memory, attempting device recreation");
+                        return self.attempt_gpu_recovery();
+                    }
+                    Some(wgpu::SurfaceError::Other) => {
+                        log::error!("GPU surface error (other), attempting device recreation");
+                        return self.attempt_gpu_recovery();
+                    }
+                    None => {}
                 }
                 Err(err)
             }
@@ -1107,8 +1156,198 @@ impl TermWindow {
     }
 
     fn do_paint_webgpu_impl(&mut self) -> anyhow::Result<bool> {
-        self.paint_impl(&mut RenderFrame::WebGpu);
+        self.paint_impl(&mut RenderFrame::WebGpu)?;
         Ok(true)
+    }
+
+    /// Attempt to recover from GPU device loss with exponential backoff.
+    /// Tries up to MAX_GPU_RECOVERY_ATTEMPTS times to recreate the WebGPU state.
+    /// If WebGPU recovery fails, falls back to OpenGL, then software rendering.
+    fn attempt_gpu_recovery(&mut self) -> anyhow::Result<bool> {
+        let delays_ms = [100, 200, 400, 800, 1600];
+
+        for attempt in 0..MAX_GPU_RECOVERY_ATTEMPTS {
+            let delay = delays_ms.get(attempt as usize).copied().unwrap_or(1600);
+            log::info!(
+                "GPU recovery attempt {}/{} (delay={}ms, backend={:?})",
+                attempt + 1,
+                MAX_GPU_RECOVERY_ATTEMPTS,
+                delay,
+                self.render_backend
+            );
+
+            std::thread::sleep(Duration::from_millis(delay));
+
+            match self.recreate_webgpu_state() {
+                Ok(()) => {
+                    log::info!("GPU recovery succeeded on attempt {}", attempt + 1);
+                    persistent_toast_notification(
+                        "WezTerm GPU Recovery",
+                        &format!("GPU recovered on attempt {}", attempt + 1),
+                    );
+                    return Ok(false); // Signal caller to retry paint next frame
+                }
+                Err(err) => {
+                    log::error!("GPU recovery attempt {} failed: {:#}", attempt + 1, err);
+                }
+            }
+        }
+
+        // WebGPU recovery exhausted, try fallback chain
+        log::error!(
+            "WebGPU recovery failed after {} attempts, attempting fallback...",
+            MAX_GPU_RECOVERY_ATTEMPTS
+        );
+        self.attempt_fallback_rendering()
+    }
+
+    /// Recreate the WebGPU state from scratch, preserving the window handle.
+    fn recreate_webgpu_state(&mut self) -> anyhow::Result<()> {
+        let handle = self
+            .webgpu
+            .as_ref()
+            .ok_or_else(|| anyhow!("no WebGPU state to recreate from"))?
+            .handle;
+
+        let dimensions = self.dimensions;
+        let config = configuration();
+
+        // Drop old render state and webgpu state
+        self.render_state = None;
+        self.webgpu = None;
+
+        // Create new WebGPU state synchronously via smol block_on
+        let new_webgpu = smol::block_on(WebGpuState::recreate(handle, dimensions, &config))?;
+        let new_webgpu = Rc::new(new_webgpu);
+        self.webgpu = Some(Rc::clone(&new_webgpu));
+
+        // Recreate RenderState from new WebGPU context
+        self.created(RenderContext::WebGpu(new_webgpu))?;
+
+        // Invalidate all caches
+        self.shape_generation += 1;
+        self.shape_cache.borrow_mut().clear();
+        self.line_to_ele_shape_cache.borrow_mut().clear();
+        self.line_state_cache.borrow_mut().clear();
+        self.line_quad_cache.borrow_mut().clear();
+        self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
+
+        self.render_backend = RenderBackend::WebGpu;
+        log::info!("WebGPU state successfully recreated");
+        Ok(())
+    }
+
+    /// Fallback chain: WebGPU -> Software WARP -> OpenGL
+    fn attempt_fallback_rendering(&mut self) -> anyhow::Result<bool> {
+        // Try software WARP fallback first (stays in wgpu pipeline)
+        if self.render_backend == RenderBackend::WebGpu {
+            log::info!("Attempting software WARP fallback...");
+            match self.recreate_webgpu_software() {
+                Ok(()) => {
+                    log::info!("Switched to software WARP rendering");
+                    self.render_backend = RenderBackend::Software;
+                    persistent_toast_notification(
+                        "WezTerm GPU Recovery",
+                        "GPU recovery failed. Switched to software rendering.",
+                    );
+                    return Ok(false);
+                }
+                Err(err) => {
+                    log::error!("Software WARP fallback failed: {:#}", err);
+                }
+            }
+        }
+
+        // Try OpenGL fallback
+        log::info!("Attempting OpenGL fallback...");
+        match self.fallback_to_opengl() {
+            Ok(()) => {
+                log::info!("Switched to OpenGL rendering");
+                self.render_backend = RenderBackend::OpenGL;
+                persistent_toast_notification(
+                    "WezTerm GPU Recovery",
+                    "GPU recovery failed. Switched to OpenGL rendering.",
+                );
+                Ok(false)
+            }
+            Err(err) => {
+                log::error!("OpenGL fallback also failed: {:#}", err);
+                persistent_toast_notification(
+                    "WezTerm GPU Error",
+                    "All rendering backends failed. WezTerm may not display correctly.",
+                );
+                Err(anyhow!(
+                    "All rendering backends failed. WebGPU, software WARP, \
+                     and OpenGL could not be initialized. Last error: {:#}",
+                    err
+                ))
+            }
+        }
+    }
+
+    /// Recreate WebGPU state using software fallback adapter (WARP on Windows)
+    fn recreate_webgpu_software(&mut self) -> anyhow::Result<()> {
+        let handle = self
+            .webgpu
+            .as_ref()
+            .ok_or_else(|| anyhow!("no WebGPU state to recreate from"))?
+            .handle;
+
+        let dimensions = self.dimensions;
+        let config = configuration();
+
+        // Drop old state
+        self.render_state = None;
+        self.webgpu = None;
+
+        let new_webgpu = smol::block_on(WebGpuState::recreate_with_software_fallback(
+            handle, dimensions, &config,
+        ))?;
+        let new_webgpu = Rc::new(new_webgpu);
+        self.webgpu = Some(Rc::clone(&new_webgpu));
+
+        self.created(RenderContext::WebGpu(new_webgpu))?;
+
+        // Invalidate all caches
+        self.shape_generation += 1;
+        self.shape_cache.borrow_mut().clear();
+        self.line_to_ele_shape_cache.borrow_mut().clear();
+        self.line_state_cache.borrow_mut().clear();
+        self.line_quad_cache.borrow_mut().clear();
+        self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
+
+        Ok(())
+    }
+
+    /// Fall back to OpenGL rendering when WebGPU is unavailable
+    fn fallback_to_opengl(&mut self) -> anyhow::Result<()> {
+        let window = self
+            .window
+            .as_ref()
+            .ok_or_else(|| anyhow!("no window available for OpenGL fallback"))?
+            .clone();
+
+        // Drop WebGPU state
+        self.render_state = None;
+        self.webgpu = None;
+
+        // Enable OpenGL on the window
+        let gl = smol::block_on(window.enable_opengl())?;
+        self.gl = Some(Rc::clone(&gl));
+        self.created(RenderContext::Glium(gl))?;
+
+        // Invalidate all caches
+        self.shape_generation += 1;
+        self.shape_cache.borrow_mut().clear();
+        self.line_to_ele_shape_cache.borrow_mut().clear();
+        self.line_state_cache.borrow_mut().clear();
+        self.line_quad_cache.borrow_mut().clear();
+        self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
+
+        Ok(())
     }
 
     fn dispatch_notif(&mut self, notif: TermWindowNotif, window: &Window) -> anyhow::Result<()> {
@@ -2032,8 +2271,10 @@ impl TermWindow {
                 self.dimensions.pixel_height / self.render_metrics.cell_size.height as usize;
             let tab_width_cols = self.config.vertical_tab_width;
             let mouse_row = if hovering_in_tab_bar {
-                let mouse_y = self.last_mouse_coords.1 as f32 - border.top.get() as f32;
-                Some((mouse_y / self.render_metrics.cell_size.height as f32) as usize)
+                self.current_mouse_event.as_ref().map(|event| {
+                    let mouse_y = event.coords.y as f32 - border.top.get() as f32;
+                    (mouse_y / self.render_metrics.cell_size.height as f32).max(0.) as usize
+                })
             } else {
                 None
             };

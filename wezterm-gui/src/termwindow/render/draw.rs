@@ -20,8 +20,14 @@ impl crate::TermWindow {
     fn call_draw_webgpu(&mut self) -> anyhow::Result<()> {
         use crate::termwindow::webgpu::WebGpuTexture;
 
-        let webgpu = self.webgpu.as_mut().unwrap();
-        let render_state = self.render_state.as_ref().unwrap();
+        let webgpu = self
+            .webgpu
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WebGPU state not available"))?;
+        let render_state = self
+            .render_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("RenderState not available"))?;
 
         let output = webgpu.surface.get_current_texture()?;
         let view = output
@@ -33,7 +39,9 @@ impl crate::TermWindow {
                 label: Some("Render Encoder"),
             });
         let tex = render_state.glyph_cache.borrow().atlas.texture();
-        let tex = tex.downcast_ref::<WebGpuTexture>().unwrap();
+        let tex = tex
+            .downcast_ref::<WebGpuTexture>()
+            .ok_or_else(|| anyhow::anyhow!("texture downcast to WebGpuTexture failed"))?;
         let texture_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let texture_linear_bind_group =
@@ -142,8 +150,30 @@ impl crate::TermWindow {
             }
         }
 
+        // Push an error scope to catch OOM or validation errors during submit
+        webgpu
+            .device
+            .push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        webgpu
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+
         // submit will accept anything that implements IntoIter
         webgpu.queue.submit(std::iter::once(encoder.finish()));
+
+        // Check for validation errors from the submit
+        if let Some(err) = smol::block_on(webgpu.device.pop_error_scope()) {
+            log::error!("GPU validation error during submit: {:?}", err);
+        }
+        // Check for OOM errors from the submit
+        if let Some(err) = smol::block_on(webgpu.device.pop_error_scope()) {
+            log::error!("GPU out-of-memory error during submit: {:?}", err);
+            return Err(anyhow::anyhow!(
+                "GPU out of memory during submit: {:?}",
+                err
+            ));
+        }
+
         output.present();
 
         Ok(())

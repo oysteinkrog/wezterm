@@ -2,6 +2,7 @@ use crate::quad::Vertex;
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use window::bitmaps::Texture2d;
@@ -35,8 +36,11 @@ pub struct WebGpuState {
     pub texture_nearest_sampler: wgpu::Sampler,
     pub texture_linear_sampler: wgpu::Sampler,
     pub handle: RawHandlePair,
+    /// Set to true when the GPU device is lost (TDR, driver crash, etc.)
+    pub device_lost: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Copy)]
 pub struct RawHandlePair {
     window: RawWindowHandle,
     display: RawDisplayHandle,
@@ -336,6 +340,17 @@ impl WebGpuState {
             })
             .await?;
 
+        let device_lost = Arc::new(AtomicBool::new(false));
+        let device_lost_clone = device_lost.clone();
+        device.set_device_lost_callback(move |reason, msg| {
+            log::error!("GPU device lost: reason={:?}, msg={}", reason, msg);
+            device_lost_clone.store(true, Ordering::SeqCst);
+        });
+
+        device.on_uncaptured_error(Box::new(|error| {
+            log::error!("Uncaptured GPU error: {:?}", error);
+        }));
+
         let queue = Arc::new(queue);
 
         // Explicitly request an SRGB format, if available
@@ -506,6 +521,250 @@ impl WebGpuState {
             texture_bind_group_layout,
             texture_nearest_sampler,
             texture_linear_sampler,
+            device_lost,
+        })
+    }
+
+    /// Recreate the WebGPU state from scratch using the same window handle.
+    /// Used for recovery after GPU device loss (TDR, driver crash, VRAM exhaustion).
+    pub async fn recreate(
+        handle: RawHandlePair,
+        dimensions: Dimensions,
+        config: &ConfigHandle,
+    ) -> anyhow::Result<Self> {
+        log::info!("Recreating WebGPU state for GPU recovery...");
+        Self::new_impl(handle, dimensions, config).await
+    }
+
+    /// Recreate with software fallback adapter (WARP on Windows).
+    pub async fn recreate_with_software_fallback(
+        handle: RawHandlePair,
+        dimensions: Dimensions,
+        config: &ConfigHandle,
+    ) -> anyhow::Result<Self> {
+        log::info!("Recreating WebGPU state with software fallback adapter...");
+        let backends = wgpu::Backends::all();
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&handle)?)?
+        };
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: true,
+            })
+            .await;
+
+        let adapter = adapter.ok_or_else(|| anyhow!("no software fallback adapter available"))?;
+
+        let adapter_info = adapter.get_info();
+        log::info!("Software fallback adapter: {adapter_info:?}");
+
+        // Continue with the same pipeline setup as new_impl
+        // but using the software adapter
+        let caps = surface.get_capabilities(&adapter);
+        let downlevel_caps = adapter.get_downlevel_capabilities();
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::empty(),
+                required_limits: if cfg!(target_arch = "wasm32") {
+                    wgpu::Limits::downlevel_webgl2_defaults()
+                } else {
+                    wgpu::Limits::downlevel_defaults()
+                }
+                .using_resolution(adapter.limits()),
+                label: None,
+                memory_hints: Default::default(),
+                trace: wgpu::Trace::Off,
+            })
+            .await?;
+
+        let device_lost = Arc::new(AtomicBool::new(false));
+        let device_lost_clone = device_lost.clone();
+        device.set_device_lost_callback(move |reason, msg| {
+            log::error!(
+                "GPU device lost (software fallback): reason={:?}, msg={}",
+                reason,
+                msg
+            );
+            device_lost_clone.store(true, Ordering::SeqCst);
+        });
+
+        device.on_uncaptured_error(Box::new(|error| {
+            log::error!("Uncaptured GPU error (software fallback): {:?}", error);
+        }));
+
+        let queue = Arc::new(queue);
+
+        let pref_format_srgb = caps.formats[0].add_srgb_suffix();
+        let format = if caps.formats.contains(&pref_format_srgb) {
+            pref_format_srgb
+        } else {
+            caps.formats[0]
+        };
+
+        let view_formats = if downlevel_caps
+            .flags
+            .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS)
+        {
+            vec![format.add_srgb_suffix(), format.remove_srgb_suffix()]
+        } else {
+            vec![]
+        };
+
+        let surf_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: dimensions.pixel_width as u32,
+            height: dimensions.pixel_height as u32,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: if caps
+                .alpha_modes
+                .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+            {
+                wgpu::CompositeAlphaMode::PostMultiplied
+            } else if caps
+                .alpha_modes
+                .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+            {
+                wgpu::CompositeAlphaMode::PreMultiplied
+            } else {
+                wgpu::CompositeAlphaMode::Auto
+            },
+            view_formats,
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &surf_config);
+
+        let shader = device.create_shader_module(wgpu::include_wgsl!("../shader.wgsl"));
+
+        let shader_uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("ShaderUniform bind group layout"),
+            });
+
+        let texture_nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let texture_linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+                label: Some("texture bind group layout"),
+            });
+
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    &shader_uniform_bind_group_layout,
+                    &texture_bind_group_layout,
+                    &texture_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surf_config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        Ok(Self {
+            adapter_info,
+            downlevel_caps,
+            surface,
+            device,
+            queue,
+            config: RefCell::new(surf_config),
+            dimensions: RefCell::new(dimensions),
+            render_pipeline,
+            handle,
+            shader_uniform_bind_group_layout,
+            texture_bind_group_layout,
+            texture_nearest_sampler,
+            texture_linear_sampler,
+            device_lost,
         })
     }
 

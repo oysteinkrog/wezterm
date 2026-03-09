@@ -19,11 +19,12 @@ impl crate::TermWindow {
 
         let border = self.get_os_border();
         let is_vertical_tab_bar = self.show_tab_bar && self.config.is_vertical_tab_bar();
-        let first_row_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom && !is_vertical_tab_bar {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.
-        } + border.top.get() as f32;
+        let first_row_offset =
+            if self.show_tab_bar && !self.config.tab_bar_at_bottom && !is_vertical_tab_bar {
+                self.tab_bar_pixel_height()?
+            } else {
+                0.
+            } + border.top.get() as f32;
 
         // Horizontal offset for left-positioned vertical tab bar
         let first_col_offset = if is_vertical_tab_bar
@@ -37,7 +38,10 @@ impl crate::TermWindow {
         let (padding_left, padding_top) = self.padding_left_top();
 
         let pos_y = split.top as f32 * cell_height + first_row_offset + padding_top;
-        let pos_x = first_col_offset + split.left as f32 * cell_width + padding_left + border.left.get() as f32;
+        let pos_x = first_col_offset
+            + split.left as f32 * cell_width
+            + padding_left
+            + border.left.get() as f32;
 
         if split.direction == SplitDirection::Horizontal {
             self.filled_rectangle(

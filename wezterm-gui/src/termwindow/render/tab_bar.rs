@@ -32,9 +32,7 @@ impl crate::TermWindow {
             let left_pixel_x = match position {
                 TabBarPosition::Left => border.left.get() as f32,
                 TabBarPosition::Right => {
-                    (self.dimensions.pixel_width as f32)
-                        - tab_bar_width
-                        - border.right.get() as f32
+                    (self.dimensions.pixel_width as f32) - tab_bar_width - border.right.get() as f32
                 }
                 _ => unreachable!(),
             };
@@ -60,6 +58,25 @@ impl crate::TermWindow {
                 } else {
                     self.config.text_background_opacity
                 });
+
+            // Fill the tab bar background
+            let tab_bar_bg = self
+                .config
+                .resolved_palette
+                .tab_bar
+                .as_ref()
+                .map(|tb| tb.background())
+                .unwrap_or_else(|| config::TabBarColors::default().background());
+            let tab_bar_height = self.dimensions.pixel_height as f32
+                - border.top.get() as f32
+                - border.bottom.get() as f32;
+            let background_rect = euclid::rect(
+                left_pixel_x,
+                border.top.get() as f32,
+                tab_bar_width,
+                tab_bar_height,
+            );
+            self.filled_rectangle(layers, 0, background_rect, tab_bar_bg.to_linear())?;
 
             // Render each vertical line
             for (row_idx, line) in self.tab_bar.vertical_lines().iter().enumerate() {

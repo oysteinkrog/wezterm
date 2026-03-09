@@ -69,11 +69,12 @@ impl crate::TermWindow {
         } else {
             0.
         };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom && !is_vertical_tab_bar {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let (top_bar_height, bottom_bar_height) =
+            if self.config.tab_bar_at_bottom && !is_vertical_tab_bar {
+                (0.0, tab_bar_height)
+            } else {
+                (tab_bar_height, 0.0)
+            };
 
         // Horizontal offset for left-positioned vertical tab bar
         let left_tab_bar_offset = if is_vertical_tab_bar
@@ -126,7 +127,8 @@ impl crate::TermWindow {
                 )
             } else {
                 (
-                    left_tab_bar_offset + padding_left + border.left.get() as f32 - (cell_width / 2.0)
+                    left_tab_bar_offset + padding_left + border.left.get() as f32
+                        - (cell_width / 2.0)
                         + (pos.left as f32 * cell_width),
                     cell_width,
                 )
@@ -617,11 +619,12 @@ impl crate::TermWindow {
         } else {
             0.
         };
-        let (top_bar_height, _bottom_bar_height) = if self.config.tab_bar_at_bottom && !is_vertical_tab_bar {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let (top_bar_height, _bottom_bar_height) =
+            if self.config.tab_bar_at_bottom && !is_vertical_tab_bar {
+                (0.0, tab_bar_height)
+            } else {
+                (tab_bar_height, 0.0)
+            };
 
         // Horizontal offset for left-positioned vertical tab bar
         let left_tab_bar_offset = if is_vertical_tab_bar

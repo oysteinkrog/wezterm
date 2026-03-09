@@ -75,8 +75,8 @@ impl crate::TermWindow {
         // Calculate dimensions based on orientation
         let (tab_bar_width, tab_bar_height) = if is_vertical {
             let width = self.tab_bar_pixel_width();
-            let height = self.dimensions.pixel_height as f32
-                - (border.top + border.bottom).get() as f32;
+            let height =
+                self.dimensions.pixel_height as f32 - (border.top + border.bottom).get() as f32;
             (width, height)
         } else {
             let height = self.tab_bar_pixel_height()?;
@@ -213,14 +213,12 @@ impl crate::TermWindow {
                     }));
 
                     if is_vertical {
-                        elem = elem
-                            .display(DisplayType::Block)
-                            .margin(BoxDimension {
-                                left: Dimension::Cells(0.),
-                                right: Dimension::Cells(0.),
-                                top: Dimension::Cells(0.2),
-                                bottom: Dimension::Cells(0.),
-                            });
+                        elem = elem.display(DisplayType::Block).margin(BoxDimension {
+                            left: Dimension::Cells(0.),
+                            right: Dimension::Cells(0.),
+                            top: Dimension::Cells(0.2),
+                            bottom: Dimension::Cells(0.),
+                        });
                     } else {
                         elem = elem.margin(BoxDimension {
                             left: Dimension::Cells(0.5),
@@ -374,7 +372,7 @@ impl crate::TermWindow {
         } else {
             ((self.dimensions.pixel_width as f32 / num_tabs)
                 - (1.5 * metrics.cell_size.width as f32))
-            .max(0.)
+                .max(0.)
         };
 
         // Reserve space for the native titlebar buttons (only for horizontal)
@@ -570,9 +568,7 @@ impl crate::TermWindow {
             ),
             TabBarPosition::Left => euclid::vec2(border.left.get() as f32, 0.),
             TabBarPosition::Right => euclid::vec2(
-                self.dimensions.pixel_width as f32
-                    - tab_bar_width
-                    - border.right.get() as f32,
+                self.dimensions.pixel_width as f32 - tab_bar_width - border.right.get() as f32,
                 0.,
             ),
         };
