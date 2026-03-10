@@ -25,7 +25,7 @@ use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     LineToElementShapeItem,
 };
-use crate::termwindow::webgpu::WebGpuState;
+use crate::termwindow::webgpu::{RawHandlePair, WebGpuState};
 use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
 use anyhow::{anyhow, ensure, Context};
@@ -594,7 +594,7 @@ impl TermWindow {
         }
 
         if self.render_state.is_none() {
-            panic!("No OpenGL");
+            anyhow::bail!("Failed to create RenderState for rendering backend");
         }
 
         Ok(())
@@ -1028,7 +1028,12 @@ impl TermWindow {
                     self.is_repaint_pending = true;
                     Ok(true)
                 } else if self.webgpu.is_some() {
-                    self.do_paint_webgpu()
+                    let result = self.do_paint_webgpu();
+                    if matches!(result, Ok(false)) {
+                        // Recovery happened, schedule a repaint
+                        window.invalidate();
+                    }
+                    result
                 } else {
                     Ok(self.do_paint(window))
                 }
@@ -1162,8 +1167,16 @@ impl TermWindow {
 
     /// Attempt to recover from GPU device loss with exponential backoff.
     /// Tries up to MAX_GPU_RECOVERY_ATTEMPTS times to recreate the WebGPU state.
-    /// If WebGPU recovery fails, falls back to OpenGL, then software rendering.
+    /// If WebGPU recovery fails, falls back to software WARP, then OpenGL.
     fn attempt_gpu_recovery(&mut self) -> anyhow::Result<bool> {
+        // Extract the window handle before dropping WebGPU state, so retries
+        // and fallback paths can use it even after self.webgpu is set to None.
+        let handle = self
+            .webgpu
+            .as_ref()
+            .ok_or_else(|| anyhow!("no WebGPU state to recover from"))?
+            .handle;
+
         let delays_ms = [100, 200, 400, 800, 1600];
 
         for attempt in 0..MAX_GPU_RECOVERY_ATTEMPTS {
@@ -1178,13 +1191,15 @@ impl TermWindow {
 
             std::thread::sleep(Duration::from_millis(delay));
 
-            match self.recreate_webgpu_state() {
+            match self.recreate_webgpu_state(handle) {
                 Ok(()) => {
                     log::info!("GPU recovery succeeded on attempt {}", attempt + 1);
-                    persistent_toast_notification(
-                        "WezTerm GPU Recovery",
-                        &format!("GPU recovered on attempt {}", attempt + 1),
-                    );
+                    if attempt > 0 {
+                        persistent_toast_notification(
+                            "WezTerm GPU Recovery",
+                            &format!("GPU recovered on attempt {}", attempt + 1),
+                        );
+                    }
                     return Ok(false); // Signal caller to retry paint next frame
                 }
                 Err(err) => {
@@ -1198,17 +1213,22 @@ impl TermWindow {
             "WebGPU recovery failed after {} attempts, attempting fallback...",
             MAX_GPU_RECOVERY_ATTEMPTS
         );
-        self.attempt_fallback_rendering()
+        self.attempt_fallback_rendering(handle)
     }
 
-    /// Recreate the WebGPU state from scratch, preserving the window handle.
-    fn recreate_webgpu_state(&mut self) -> anyhow::Result<()> {
-        let handle = self
-            .webgpu
-            .as_ref()
-            .ok_or_else(|| anyhow!("no WebGPU state to recreate from"))?
-            .handle;
+    /// Invalidate all rendering caches after a backend change.
+    fn invalidate_all_caches(&mut self) {
+        self.shape_generation += 1;
+        self.shape_cache.borrow_mut().clear();
+        self.line_to_ele_shape_cache.borrow_mut().clear();
+        self.line_state_cache.borrow_mut().clear();
+        self.line_quad_cache.borrow_mut().clear();
+        self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
+    }
 
+    /// Recreate the WebGPU state from scratch using the given window handle.
+    fn recreate_webgpu_state(&mut self, handle: RawHandlePair) -> anyhow::Result<()> {
         let dimensions = self.dimensions;
         let config = configuration();
 
@@ -1224,26 +1244,18 @@ impl TermWindow {
         // Recreate RenderState from new WebGPU context
         self.created(RenderContext::WebGpu(new_webgpu))?;
 
-        // Invalidate all caches
-        self.shape_generation += 1;
-        self.shape_cache.borrow_mut().clear();
-        self.line_to_ele_shape_cache.borrow_mut().clear();
-        self.line_state_cache.borrow_mut().clear();
-        self.line_quad_cache.borrow_mut().clear();
-        self.invalidate_fancy_tab_bar();
-        self.invalidate_modal();
-
+        self.invalidate_all_caches();
         self.render_backend = RenderBackend::WebGpu;
         log::info!("WebGPU state successfully recreated");
         Ok(())
     }
 
     /// Fallback chain: WebGPU -> Software WARP -> OpenGL
-    fn attempt_fallback_rendering(&mut self) -> anyhow::Result<bool> {
+    fn attempt_fallback_rendering(&mut self, handle: RawHandlePair) -> anyhow::Result<bool> {
         // Try software WARP fallback first (stays in wgpu pipeline)
         if self.render_backend == RenderBackend::WebGpu {
             log::info!("Attempting software WARP fallback...");
-            match self.recreate_webgpu_software() {
+            match self.recreate_webgpu_software(handle) {
                 Ok(()) => {
                     log::info!("Switched to software WARP rendering");
                     self.render_backend = RenderBackend::Software;
@@ -1287,13 +1299,7 @@ impl TermWindow {
     }
 
     /// Recreate WebGPU state using software fallback adapter (WARP on Windows)
-    fn recreate_webgpu_software(&mut self) -> anyhow::Result<()> {
-        let handle = self
-            .webgpu
-            .as_ref()
-            .ok_or_else(|| anyhow!("no WebGPU state to recreate from"))?
-            .handle;
-
+    fn recreate_webgpu_software(&mut self, handle: RawHandlePair) -> anyhow::Result<()> {
         let dimensions = self.dimensions;
         let config = configuration();
 
@@ -1309,15 +1315,7 @@ impl TermWindow {
 
         self.created(RenderContext::WebGpu(new_webgpu))?;
 
-        // Invalidate all caches
-        self.shape_generation += 1;
-        self.shape_cache.borrow_mut().clear();
-        self.line_to_ele_shape_cache.borrow_mut().clear();
-        self.line_state_cache.borrow_mut().clear();
-        self.line_quad_cache.borrow_mut().clear();
-        self.invalidate_fancy_tab_bar();
-        self.invalidate_modal();
-
+        self.invalidate_all_caches();
         Ok(())
     }
 
@@ -1338,15 +1336,7 @@ impl TermWindow {
         self.gl = Some(Rc::clone(&gl));
         self.created(RenderContext::Glium(gl))?;
 
-        // Invalidate all caches
-        self.shape_generation += 1;
-        self.shape_cache.borrow_mut().clear();
-        self.line_to_ele_shape_cache.borrow_mut().clear();
-        self.line_state_cache.borrow_mut().clear();
-        self.line_quad_cache.borrow_mut().clear();
-        self.invalidate_fancy_tab_bar();
-        self.invalidate_modal();
-
+        self.invalidate_all_caches();
         Ok(())
     }
 

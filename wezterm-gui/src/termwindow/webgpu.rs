@@ -354,11 +354,15 @@ impl WebGpuState {
         let queue = Arc::new(queue);
 
         // Explicitly request an SRGB format, if available
-        let pref_format_srgb = caps.formats[0].add_srgb_suffix();
+        let first_format = *caps
+            .formats
+            .first()
+            .ok_or_else(|| anyhow!("surface is incompatible with adapter: no supported formats"))?;
+        let pref_format_srgb = first_format.add_srgb_suffix();
         let format = if caps.formats.contains(&pref_format_srgb) {
             pref_format_srgb
         } else {
-            caps.formats[0]
+            first_format
         };
 
         // Need to check that this is supported, as trying to set
@@ -602,11 +606,15 @@ impl WebGpuState {
 
         let queue = Arc::new(queue);
 
-        let pref_format_srgb = caps.formats[0].add_srgb_suffix();
+        let first_format = *caps
+            .formats
+            .first()
+            .ok_or_else(|| anyhow!("surface is incompatible with software adapter: no supported formats"))?;
+        let pref_format_srgb = first_format.add_srgb_suffix();
         let format = if caps.formats.contains(&pref_format_srgb) {
             pref_format_srgb
         } else {
-            caps.formats[0]
+            first_format
         };
 
         let view_formats = if downlevel_caps

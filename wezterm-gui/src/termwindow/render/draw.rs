@@ -161,17 +161,14 @@ impl crate::TermWindow {
         // submit will accept anything that implements IntoIter
         webgpu.queue.submit(std::iter::once(encoder.finish()));
 
-        // Check for validation errors from the submit
+        // Pop error scopes in LIFO order (Validation first, then OOM)
         if let Some(err) = smol::block_on(webgpu.device.pop_error_scope()) {
             log::error!("GPU validation error during submit: {:?}", err);
+            return Err(anyhow::anyhow!(err).context("GPU validation error during submit"));
         }
-        // Check for OOM errors from the submit
         if let Some(err) = smol::block_on(webgpu.device.pop_error_scope()) {
             log::error!("GPU out-of-memory error during submit: {:?}", err);
-            return Err(anyhow::anyhow!(
-                "GPU out of memory during submit: {:?}",
-                err
-            ));
+            return Err(wgpu::SurfaceError::OutOfMemory.into());
         }
 
         output.present();
