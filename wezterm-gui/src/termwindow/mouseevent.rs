@@ -307,12 +307,15 @@ impl super::TermWindow {
         let dims = pane.get_dimensions();
         let current_viewport = self.get_viewport(pane.pane_id());
 
-        let tab_bar_height = if self.show_tab_bar {
+        let is_vertical_tab_bar = self.show_tab_bar && self.config.is_vertical_tab_bar();
+        let tab_bar_height = if self.show_tab_bar && !is_vertical_tab_bar {
             self.tab_bar_pixel_height().unwrap_or(0.)
         } else {
             0.
         };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
+        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom
+            && !is_vertical_tab_bar
+        {
             (0.0, tab_bar_height)
         } else {
             (tab_bar_height, 0.0)
