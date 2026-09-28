@@ -69,11 +69,23 @@ impl super::TermWindow {
 
         let border = self.get_os_border();
 
-        let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.) as isize
+        let is_vertical_tab_bar = self.config.is_vertical_tab_bar();
+        let first_line_offset =
+            if self.show_tab_bar && !is_vertical_tab_bar && !self.config.tab_bar_at_bottom {
+                self.tab_bar_pixel_height().unwrap_or(0.) as isize
+            } else {
+                0
+            } + border.top.get() as isize;
+
+        // A vertical tab bar on the left pushes the panes right; match the
+        // offset used when rendering them (render/pane.rs).
+        let left_tab_bar_offset = if is_vertical_tab_bar
+            && self.config.effective_tab_bar_position() == config::TabBarPosition::Left
+        {
+            self.tab_bar_pixel_width()
         } else {
-            0
-        } + border.top.get() as isize;
+            0.
+        };
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -88,7 +100,7 @@ impl super::TermWindow {
         let x = (event
             .coords
             .x
-            .sub((padding_left + border.left.get() as f32) as isize)
+            .sub((padding_left + border.left.get() as f32 + left_tab_bar_offset) as isize)
             .max(0) as f32)
             / self.render_metrics.cell_size.width as f32;
         let x = if !pane.is_mouse_grabbed() {
@@ -112,7 +124,7 @@ impl super::TermWindow {
         let mut x_pixel_offset = event
             .coords
             .x
-            .sub((padding_left + border.left.get() as f32) as isize);
+            .sub((padding_left + border.left.get() as f32 + left_tab_bar_offset) as isize);
         if x > 0 {
             x_pixel_offset = x_pixel_offset.max(0) % self.render_metrics.cell_size.width;
         }
